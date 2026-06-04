@@ -17,12 +17,22 @@ from app.schemas.models import (
 )
 
 
+def merge_papers(existing: List[RankedPaper], new: List[RankedPaper]) -> List[RankedPaper]:
+    """
+    Custom reducer: accumulate papers across iterations, deduplicate by arxiv_id.
+    operator.add would blindly append — this prevents duplicates on re-runs.
+    """
+    seen = {p.arxiv_id for p in existing}
+    deduped = [p for p in new if p.arxiv_id not in seen]
+    return existing + deduped
+
+
 class StateDict(TypedDictExt):
     """
     LangGraph state definition.
     
     Reducers define how state merges when multiple nodes update the same field:
-    - List fields: use operator.add to APPEND (don't overwrite)
+    - List fields: use custom reducers or operator.add to APPEND (don't overwrite)
     - Other fields: default behavior is OVERWRITE (last node wins)
     """
     
@@ -34,8 +44,11 @@ class StateDict(TypedDictExt):
     strategy: Optional[ResearchStrategy]
     
     # --- PAPERS & RANKING ---
-    # Reducer: operator.add appends new papers, doesn't replace
-    papers: Annotated[List[RankedPaper], operator.add]
+    # Custom reducer: accumulates across iterations, deduplicates by arxiv_id
+    papers: Annotated[List[RankedPaper], merge_papers]
+    
+    # Separate field for ranked/sorted view — ranking_node writes here, not to papers
+    ranked_papers: Optional[List[RankedPaper]]
     
     # --- KNOWLEDGE GAPS ---
     # Reducer: operator.add appends gaps

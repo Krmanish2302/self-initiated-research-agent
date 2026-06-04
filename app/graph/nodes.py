@@ -225,7 +225,7 @@ No other text.
             ranked_papers.append(ranked_paper)
         
         return {
-            "papers": ranked_papers,  # Reducer will append to state.papers
+            "papers": ranked_papers,  # merge_papers reducer deduplicates by arxiv_id
             "status": "papers_collected",
             "search_queries_tried": search_queries,
             "iteration_count": state["iteration_count"] + 1,
@@ -249,7 +249,11 @@ def ranking_node(state: StateDict) -> dict[str, Any]:
     Rank papers by composite score (citation + recency + relevance).
     
     Input: papers (collected so far)
-    Output: same papers, but sorted and with composite_rank_score set
+    Output: ranked_papers (sorted view) — does NOT write back to papers
+    
+    Key fix: ranking is a VIEW over papers, not a mutation.
+    Writing back to papers field caused duplication via operator.add reducer.
+    Now writes to ranked_papers (Optional field, plain overwrite).
     
     Note: Synchronous (pure math, no I/O)
     """
@@ -266,8 +270,11 @@ def ranking_node(state: StateDict) -> dict[str, Any]:
         # Call the paper_ranker_tool
         ranked = paper_ranker_tool.func(papers)
         
+        # Write to ranked_papers (separate field) — NOT back to papers
+        # This prevents the duplication bug where operator.add would append
+        # the same ranked list on top of already-collected papers
         return {
-            "papers": ranked,
+            "ranked_papers": ranked,
             "status": "papers_ranked",
             "iteration_count": state["iteration_count"] + 1,
         }
@@ -302,12 +309,13 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
                 "status": "no_papers_to_analyze",
             }
         
-        papers = state["papers"]
-        logger.info(f"gap_analysis_node: analyzing {len(papers)} papers")
+        # Use ranked_papers if available, fall back to papers
+        papers_to_analyze = state.get("ranked_papers") or state["papers"]
+        logger.info(f"gap_analysis_node: analyzing {len(papers_to_analyze)} papers")
         
         # Call gap analyzer tool (which calls LLM internally)
         gaps = await gap_analyzer_tool.coroutine(
-            papers=papers[:settings.max_papers_per_iteration],
+            papers=papers_to_analyze[:settings.max_papers_per_iteration],
             goal=state["goal"],
             conversation_history=state.get("conversation_history", []),
         )
@@ -396,13 +404,6 @@ No other text.
             logger.warning(f"Failed to parse questions: {e}")
             questions = ["Can you clarify your research goals?"]
         
-        # Add questions to conversation history
-        for q in questions:
-            state["conversation_history"].append({
-                "role": "agent",
-                "content": q,
-            })
-        
         return {
             "conversation_history": [{"role": "agent", "content": q} for q in questions],
             "status": "awaiting_user_input",
@@ -426,11 +427,12 @@ async def synthesis_node(state: StateDict) -> dict[str, Any]:
     """
     Generate the final research brief from collected papers and insights.
     
-    Input: papers, gaps, goal, conversation_history
+    Input: ranked_papers (preferred) or papers, gaps, goal, conversation_history
     Output: ResearchBrief (executive_summary, key_findings, remaining_gaps, etc.)
     """
     try:
-        papers = state.get("papers", [])
+        # Use ranked_papers if available (they have composite scores set)
+        papers = state.get("ranked_papers") or state.get("papers", [])
         gaps = state.get("gaps", [])
         
         logger.info(f"synthesis_node: synthesizing brief from {len(papers)} papers")
@@ -490,8 +492,6 @@ No other text.
         
         return {
             "status": "complete",
-            # Note: We could store the brief in state if needed, but for now
-            # we just return it (the graph will end after this node)
         }
     
     except Exception as e:
