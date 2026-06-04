@@ -1,0 +1,25 @@
+# Environment variables
+.env
+.antigravity\memory
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# LangSmith & Agent
+research_agent.db
+.langsmith_cache/
+.antigravity/memory/GEMINI.md
+.antigravity/memory/TECH_STACK.md
+.antigravity/memory/Timeline.md
+tests/eval_dataset.json
+tests/test_nodes.py

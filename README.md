@@ -1,1 +1,0 @@
-# self-initiated-research-agent
