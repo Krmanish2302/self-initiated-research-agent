@@ -7,8 +7,7 @@ Configures checkpointing for HITL (Human-in-the-Loop) pauses.
 
 import logging
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
-
+from langgraph.checkpoint.memory import MemorySaver
 from app.schemas.models import AgentState
 from app.graph.state import StateDict
 from app.graph.nodes import (
@@ -72,13 +71,11 @@ def build_graph():
     # ================================================================
     # COMPILE WITH CHECKPOINTING
     # ================================================================
-    checkpointer = SqliteSaver(settings.checkpoint_db_path)
-    
+    checkpointer = MemorySaver()
     app = graph.compile(
         checkpointer=checkpointer,
-        # interrupt_after=["gap_analysis"],  # Uncomment for HITL pauses after gap analysis
     )
-    
+
     logger.info("Graph compiled successfully")
     return app
 

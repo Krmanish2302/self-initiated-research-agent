@@ -7,28 +7,22 @@ from datetime import datetime
 # ============================================================
 # PAPER MODELS
 # ============================================================
+class RankingWeights(BaseModel):
+    """Weights for composite ranking score components"""
+    citation_weight: float = Field(default=0.33, ge=0, le=1)
+    relevance_weight: float = Field(default=0.33, ge=0, le=1)
+    recency_weight: float = Field(default=0.34, ge=0, le=1)
+
 
 class PaperMetadata(BaseModel):
-    """Raw paper metadata from ArXiv API"""
-    arxiv_id: str = Field(..., description="Unique ArXiv identifier (e.g., 2401.12345)")
-    title: str = Field(..., description="Paper title")
-    authors: List[str] = Field(default_factory=list, description="List of author names")
-    abstract: str = Field(..., description="Paper abstract")
-    published_date: str = Field(..., description="Publication date (YYYY-MM-DD)")
-    url: str = Field(..., description="URL to paper on ArXiv")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "arxiv_id": "2401.12345",
-                "title": "Efficient Transformers via Sparse Attention",
-                "authors": ["Alice", "Bob"],
-                "abstract": "We propose...",
-                "published_date": "2024-01-15",
-                "url": "https://arxiv.org/abs/2401.12345"
-            }
-        }
-
+    arxiv_id: str
+    title: str
+    authors: List[str] = Field(default_factory=list)
+    abstract: str
+    published_date: str
+    url: str          
+    pdf_url: str = Field(default="")   
+    source: str = Field(default="arxiv")  
 
 class CitationData(BaseModel):
     """Citation metrics from Semantic Scholar API"""

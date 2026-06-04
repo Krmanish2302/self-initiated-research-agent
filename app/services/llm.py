@@ -12,12 +12,11 @@ def get_llm():
         ChatGroq: Configured LLM client
     """
     llm = ChatGroq(
-        api_key=settings.groq_api_key,
-        model_name=settings.llm_model_name,
+        api_key=settings.GROQ_API_KEY,
+        model_name=settings.LLM_MODEL_NAME,
         temperature=0.1,  # Low: deterministic, reliable for research
         max_tokens=2048,  # Max output tokens per call
         timeout=30,       # Fail fast if API hangs
-        top_k=40,         # Nucleus sampling: keep top 40 tokens
         top_p=0.95,       # Cumulative probability cutoff
     )
     return llm

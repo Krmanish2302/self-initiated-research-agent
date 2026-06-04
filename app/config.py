@@ -70,10 +70,19 @@ class Settings(BaseSettings):
           1,238 / 350 ≈ 3 papers max
         """
         return self.available_context_for_papers // self.TOKENS_PER_PAPER
+    # Checkpointing
+    CHECKPOINT_DB_PATH: str = "research_agent.db"
     
+    # builder.py uses snake_case
+    @property
+    def checkpoint_db_path(self) -> str:
+        return self.CHECKPOINT_DB_PATH
+
+        
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 # Global settings instance (singleton)
 settings = Settings()

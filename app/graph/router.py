@@ -31,9 +31,12 @@ def should_continue(state: StateDict) -> str:
         logger.info(f"should_continue: max_iterations ({state['max_iterations']}) reached")
         return "synthesis"
     
-    if state["status"] == "error":
-        logger.warning(f"should_continue: error state detected: {state.get('last_error')}")
-        # Could return "error_handler" if you have one, or go straight to synthesis
+    if state["status"] == "error" or not state.get("strategy"):
+        logger.warning(f"should_continue: error state or missing strategy: {state.get('last_error')}")
+        return "synthesis"
+        
+    if state["status"] in ["no_papers_to_analyze", "no_papers_to_rank"]:
+        logger.info(f"should_continue: status is {state['status']}, transitioning to synthesis")
         return "synthesis"
     
     if state["status"] == "no_results":

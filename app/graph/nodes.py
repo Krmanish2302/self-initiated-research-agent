@@ -161,19 +161,20 @@ No other text.
         
         logger.info(f"paper_collection_node: generated queries {search_queries}")
         
-        # STEP 2: Execute all queries in parallel
-        search_tasks = [
-            arxiv_search_tool(
-                query=q,
-                max_results=20,
-                date_range_start=strategy.date_range_start,
-                date_range_end=strategy.date_range_end,
-            )
-            for q in search_queries
-        ]
-        
-        # Gather all results in parallel
-        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        # STEP 2: Execute all queries sequentially to respect ArXiv rate limits
+        search_results = []
+        for q in search_queries:
+            try:
+                res = await arxiv_search_tool.coroutine(
+                    query=q,
+                    max_results=20,
+                    date_range_start=strategy.date_range_start,
+                    date_range_end=strategy.date_range_end,
+                )
+                search_results.append(res)
+                await asyncio.sleep(1.0)  # Short pause to prevent API blocking
+            except Exception as e:
+                search_results.append(e)
         
         # Flatten results and handle errors
         all_papers = []
@@ -194,7 +195,7 @@ No other text.
         
         # STEP 3: Fetch citation data for each paper (parallel)
         citation_tasks = [
-            semantic_scholar_tool(paper.arxiv_id)
+            semantic_scholar_tool.coroutine(paper.arxiv_id)
             for paper in all_papers
         ]
         
@@ -219,7 +220,7 @@ No other text.
                 relevance_score=0.5,  # Will be refined by gap analyzer
                 recency_score=0.5,    # Will be refined by ranking node
                 composite_rank_score=0.0,  # Will be set by ranking node
-                rank_position=0,
+                rank_position=1,
             )
             ranked_papers.append(ranked_paper)
         
@@ -263,7 +264,7 @@ def ranking_node(state: StateDict) -> dict[str, Any]:
         logger.info(f"ranking_node: ranking {len(papers)} papers")
         
         # Call the paper_ranker_tool
-        ranked = paper_ranker_tool(papers)
+        ranked = paper_ranker_tool.func(papers)
         
         return {
             "papers": ranked,
@@ -305,7 +306,7 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
         logger.info(f"gap_analysis_node: analyzing {len(papers)} papers")
         
         # Call gap analyzer tool (which calls LLM internally)
-        gaps = await gap_analyzer_tool(
+        gaps = await gap_analyzer_tool.coroutine(
             papers=papers[:settings.max_papers_per_iteration],
             goal=state["goal"],
             conversation_history=state.get("conversation_history", []),
