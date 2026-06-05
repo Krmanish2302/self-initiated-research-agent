@@ -1,260 +1,155 @@
-# self_initiated_research_agent/app/schemas/models.py
+"""
+Pydantic models for the research agent.
 
+All state fields, tool inputs/outputs, and API payloads are typed here.
+M10 additions:
+  - ClarifyingQuestion: typed question object from clarification_node
+  - AgentState: added clarifying_questions + user_answers fields
+"""
+
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Annotated
 from pydantic import BaseModel, Field
-from typing import Optional, List
 from datetime import datetime
+import operator
 
-# ============================================================
+
+# ============================================================================
 # PAPER MODELS
-# ============================================================
-class RankingWeights(BaseModel):
-    """Weights for composite ranking score components"""
-    citation_weight: float = Field(default=0.33, ge=0, le=1)
-    relevance_weight: float = Field(default=0.33, ge=0, le=1)
-    recency_weight: float = Field(default=0.34, ge=0, le=1)
-
+# ============================================================================
 
 class PaperMetadata(BaseModel):
     arxiv_id: str
     title: str
-    authors: List[str] = Field(default_factory=list)
+    authors: List[str]
     abstract: str
     published_date: str
-    url: str          
-    pdf_url: str = Field(default="")   
-    source: str = Field(default="arxiv")  
+    pdf_url: str
+    categories: List[str] = []
+
 
 class CitationData(BaseModel):
-    """Citation metrics from Semantic Scholar API"""
-    citation_count: int = Field(default=0, description="Total citation count")
-    influential_citation_count: int = Field(default=0, description="Highly influential citations")
-    h_index: Optional[int] = Field(default=None, description="H-index of paper (if available)")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "citation_count": 245,
-                "influential_citation_count": 18,
-                "h_index": None
-            }
-        }
+    citation_count: int = 0
+    influential_citation_count: int = 0
+    h_index: int = 0
 
 
 class RankedPaper(BaseModel):
-    """Paper with ranking scores and final position"""
     arxiv_id: str
     title: str
     authors: List[str]
     abstract: str
     published_date: str
     url: str
-    
-    # Ranking components (from our paper_ranker_tool)
-    citation_count: int
-    relevance_score: float = Field(..., ge=0, le=1, description="0-1 relevance to goal")
-    recency_score: float = Field(..., ge=0, le=1, description="0-1 recency (newer=higher)")
-    composite_rank_score: float = Field(..., ge=0, le=3, description="Sum of weighted scores")
-    
-    # Final position in sorted list
-    rank_position: int = Field(..., ge=1, description="Position in ranked papers (1=best)")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "arxiv_id": "2401.12345",
-                "title": "Efficient Transformers",
-                "authors": ["Alice"],
-                "abstract": "We propose...",
-                "published_date": "2024-01-15",
-                "url": "https://arxiv.org/abs/2401.12345",
-                "citation_count": 245,
-                "relevance_score": 0.95,
-                "recency_score": 0.88,
-                "composite_rank_score": 2.78,
-                "rank_position": 1
-            }
-        }
+    citation_count: int = 0
+    relevance_score: float = 0.5
+    recency_score: float = 0.5
+    composite_rank_score: float = 0.0
+    rank_position: int = 1
 
 
-# ============================================================
-# KNOWLEDGE GAP MODELS
-# ============================================================
-
-class KnowledgeGap(BaseModel):
-    """A gap in understanding identified by the agent"""
-    gap_id: str = Field(..., description="Unique ID for this gap (e.g., 'gap_001')")
-    description: str = Field(..., description="What don't we know yet?")
-    relevance_to_goal: float = Field(..., ge=0, le=1, description="How important is this gap?")
-    is_resolved: bool = Field(default=False, description="Did the user answer our question?")
-    user_answer: Optional[str] = Field(default=None, description="User's response if resolved")
-    clarifying_question: Optional[str] = Field(default=None, description="Question we asked to fill this gap")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "gap_id": "gap_001",
-                "description": "No papers on vision transformer efficiency",
-                "relevance_to_goal": 0.9,
-                "is_resolved": False,
-                "user_answer": None,
-                "clarifying_question": "Are you interested in vision transformers specifically?"
-            }
-        }
-
-
-# ============================================================
-# STRATEGY & PLANNING MODELS
-# ============================================================
+# ============================================================================
+# STRATEGY + GAP MODELS
+# ============================================================================
 
 class ResearchStrategy(BaseModel):
-    """Decomposed research plan created by planning_node"""
-    topics: List[str] = Field(..., description="Search topics (e.g., ['perception', 'planning'])")
-    date_range_start: Optional[str] = Field(default=None, description="Start date (YYYY-MM-DD)")
-    date_range_end: Optional[str] = Field(default=None, description="End date (YYYY-MM-DD)")
-    ranking_criteria: List[str] = Field(
-        default=["citation_count", "relevance", "recency"],
-        description="What to weight in ranking"
+    topics: List[str] = Field(description="3-5 specific topics to search")
+    date_range_start: Optional[str] = Field(None, description="YYYY-MM-DD")
+    date_range_end: Optional[str] = Field(None, description="YYYY-MM-DD")
+    ranking_criteria: str = Field(default="balanced")
+    search_depth: str = Field(default="balanced")
+
+
+class KnowledgeGap(BaseModel):
+    gap_id: str = Field(description="Unique identifier for this gap, e.g. 'gap_1'")
+    description: str = Field(description="What is missing from current research")
+    priority: int = Field(default=1, description="1=highest priority")
+    resolved: bool = Field(default=False)
+
+
+# ============================================================================
+# M10 — CLARIFYING QUESTION MODEL (new)
+# ============================================================================
+
+class ClarifyingQuestion(BaseModel):
+    """
+    A typed clarifying question generated by clarification_node.
+
+    Using typed objects instead of freeform strings:
+      - API can filter by question_type (surface constraints to user first)
+      - human_input_node can route answers to the right state field
+        (constraint/preference → user_preferences; clarification → history only)
+      - required=True questions block the agent from continuing without an answer
+      - gap_id links the question back to the KnowledgeGap that triggered it
+    """
+    question: str = Field(description="The question text to show the user")
+    gap_id: str = Field(description="Which KnowledgeGap this question addresses")
+    question_type: str = Field(
+        description="'preference' | 'constraint' | 'clarification'"
     )
-    max_papers_target: int = Field(default=20, description="Ideal number of papers to collect")
-    search_depth: str = Field(default="balanced", description="'broad', 'balanced', or 'deep'")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "topics": ["transformer efficiency", "attention mechanisms"],
-                "date_range_start": "2022-01-01",
-                "date_range_end": "2024-12-31",
-                "ranking_criteria": ["citation_count", "relevance", "recency"],
-                "max_papers_target": 20,
-                "search_depth": "balanced"
-            }
-        }
+    required: bool = Field(
+        default=True,
+        description="If True, agent cannot continue without this answer"
+    )
 
 
-# ============================================================
-# AGENT STATE MODEL (The Big One)
-# ============================================================
+# ============================================================================
+# RESEARCH BRIEF
+# ============================================================================
+
+class ResearchBrief(BaseModel):
+    executive_summary: str = ""
+    key_findings: List[str] = []
+    remaining_gaps: List[str] = []
+    next_steps: List[str] = []
+    iterations_taken: int = 0
+    total_papers_found: int = 0
+    top_papers: List[RankedPaper] = []
+
+
+# ============================================================================
+# AGENT STATE
+# ============================================================================
 
 class AgentState(BaseModel):
     """
-    The full state of the research agent.
-    This flows between nodes and is persisted by the checkpointer.
+    Full state of the research agent.
+
+    LangGraph uses field annotations to decide reducer behavior:
+      Annotated[List[X], operator.add]  → append (never overwrite)
+      Optional[X]                       → plain overwrite
+
+    M10 additions:
+      clarifying_questions: typed ClarifyingQuestion objects from clarification_node
+      user_answers:         injected by update_state() during HITL resume
     """
 
-    # --- GOAL & CONTEXT ---
-    goal: str = Field(..., description="User's research goal")
-    user_preferences: dict = Field(
-        default_factory=dict,
-        description="User preferences (date range, specific subtopics, etc.)"
-    )
+    # ── Core ──────────────────────────────────────────────────────────────────
+    goal: str = ""
+    status: str = "initialized"
+    iteration_count: int = 0
+    last_error: Optional[str] = None
 
-    # --- PLANNING ---
-    strategy: Optional[ResearchStrategy] = Field(
-        default=None,
-        description="Current research strategy (set by planning_node)"
-    )
+    # ── Papers (append-only via reducer) ──────────────────────────────────────
+    papers: Annotated[List[RankedPaper], operator.add] = []
+    ranked_papers: Optional[List[RankedPaper]] = None       # overwrite each iteration
 
-    # --- PAPERS & RANKING ---
-    papers: List[RankedPaper] = Field(
-        default_factory=list,
-        description="Papers collected and ranked so far"
-    )
+    # ── Strategy + Gaps ───────────────────────────────────────────────────────
+    strategy: Optional[ResearchStrategy] = None
+    gaps: Annotated[List[KnowledgeGap], operator.add] = []
 
-    # --- KNOWLEDGE GAPS ---
-    gaps: List[KnowledgeGap] = Field(
-        default_factory=list,
-        description="Knowledge gaps identified by gap_analyzer_node"
-    )
+    # ── Memory ────────────────────────────────────────────────────────────────
+    conversation_history: Annotated[List[Dict[str, Any]], operator.add] = []
+    summarized_history: str = ""                            # compressed archive
+    user_preferences: Optional[Dict[str, Any]] = None
+    failed_searches: Annotated[List[str], operator.add] = []
+    search_queries_tried: Annotated[List[str], operator.add] = []
 
-    # --- CONVERSATION HISTORY ---
-    conversation_history: List[dict] = Field(
-        default_factory=list,
-        description="Messages between agent and user (for context + HITL)"
-    )
+    # ── HITL (M10) ────────────────────────────────────────────────────────────
+    clarifying_questions: Optional[List[ClarifyingQuestion]] = None
+    # user_answers is injected via update_state() during resume.
+    # human_input_node reads it, merges into history, then clears it.
+    user_answers: Optional[List[Dict[str, Any]]] = None
 
-    # --- ITERATION TRACKING ---
-    iteration_count: int = Field(default=0, description="How many loops have we done?")
-    max_iterations: int = Field(default=5, description="Hard limit on iterations")
-    
-    # --- STATUS & CONTROL ---
-    status: str = Field(
-        default="initialized",
-        description="Current state: initialized, planning, searching, analyzing, paused, complete, error"
-    )
-    last_error: Optional[str] = Field(default=None, description="Last error message if any")
-
-    # --- SEARCH HISTORY (for loop detection) ---
-    search_queries_tried: List[str] = Field(
-        default_factory=list,
-        description="All search queries attempted (to avoid repeating failed searches)"
-    )
-    failed_searches: List[str] = Field(
-        default_factory=list,
-        description="Searches that returned 0 results"
-    )
-
-    # --- CONTEXT MANAGEMENT ---
-    summarized_history: Optional[str] = Field(
-        default=None,
-        description="Compressed version of old conversation for context budgeting"
-    )
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "goal": "Understand transformer efficiency improvements",
-                "user_preferences": {"date_range": "2023-2024", "focus": "vision transformers"},
-                "strategy": None,
-                "papers": [],
-                "gaps": [],
-                "conversation_history": [],
-                "iteration_count": 0,
-                "max_iterations": 5,
-                "status": "initialized",
-                "last_error": None,
-                "search_queries_tried": [],
-                "failed_searches": []
-            }
-        }
-
-
-# ============================================================
-# API REQUEST/RESPONSE MODELS (for FastAPI, MODULE 13)
-# ============================================================
-
-class ResearchGoalRequest(BaseModel):
-    """User's request to start research"""
-    goal: str = Field(..., description="What do you want to research?")
-    user_preferences: dict = Field(
-        default_factory=dict,
-        description="Optional preferences (date_range, subtopics, etc.)"
-    )
-
-
-class UserAnswerRequest(BaseModel):
-    """User's response to a clarifying question during HITL pause"""
-    answer: str = Field(..., description="User's answer")
-
-
-class ResearchBrief(BaseModel):
-    """Final output from synthesis_node"""
-    executive_summary: str = Field(..., description="High-level overview")
-    top_papers: List[RankedPaper] = Field(..., description="Best papers found")
-    key_findings: List[str] = Field(..., description="Main insights from the research")
-    remaining_gaps: List[str] = Field(..., description="What we still don't know")
-    next_steps: List[str] = Field(..., description="Recommendations for deeper research")
-    iterations_taken: int = Field(..., description="How many loops did we do?")
-    total_papers_found: int = Field(..., description="How many papers were discovered?")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "executive_summary": "Transformer efficiency has improved 3x in 2 years...",
-                "top_papers": [],  # List of RankedPaper objects
-                "key_findings": ["Attention sparsity is key", "Vision models lag text models"],
-                "remaining_gaps": ["Mobile deployment efficiency", "Real-time inference"],
-                "next_steps": ["Investigate edge deployment", "Study knowledge distillation"],
-                "iterations_taken": 3,
-                "total_papers_found": 18
-            }
-        }
+    # ── Output ────────────────────────────────────────────────────────────────
+    research_brief: Optional[ResearchBrief] = None

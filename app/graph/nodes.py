@@ -7,6 +7,10 @@ Each node:
 - LangGraph reducers merge updates (append for lists, overwrite for others)
 - Has try-except to set status="error" on failure
 - Is async for I/O-bound work (LLM calls, tool calls)
+
+M10 additions:
+  - clarification_node: now returns typed ClarifyingQuestion Pydantic objects
+  - human_input_node: merges user answers into conversation_history
 """
 
 import asyncio
@@ -22,6 +26,7 @@ from app.schemas.models import (
     ResearchBrief,
     PaperMetadata,
     CitationData,
+    ClarifyingQuestion,
 )
 from app.config import settings
 from app.services.llm import llm
@@ -61,14 +66,12 @@ async def planning_node(state: StateDict) -> dict[str, Any]:
 
         iteration = state["iteration_count"]
 
-        # --- PROCEDURAL MEMORY: what failed before ---
         failed = state.get("failed_searches", [])
         failed_context = (
             f"\nFailed searches (DO NOT retry these): {failed}"
             if failed else ""
         )
 
-        # --- EPISODIC MEMORY: user clarifications ---
         history = state.get("conversation_history", [])
         user_messages = [m["content"] for m in history if m.get("role") == "user"]
         history_context = (
@@ -76,7 +79,6 @@ async def planning_node(state: StateDict) -> dict[str, Any]:
             if user_messages else ""
         )
 
-        # --- SEMANTIC MEMORY: topics already covered ---
         collected_topics = list({p.title[:40] for p in state.get("papers", [])})
         collected_context = (
             f"\nTopics already covered (avoid duplicating): {collected_topics[:10]}"
@@ -102,7 +104,6 @@ Create a strategy with NEW topics not already covered above:
 Return ONLY valid JSON, no other text.
 """
 
-        # Force structured output to ResearchStrategy Pydantic model
         structured_llm = llm.with_structured_output(ResearchStrategy)
 
         strategy = await asyncio.to_thread(
@@ -135,13 +136,8 @@ async def paper_collection_node(state: StateDict) -> dict[str, Any]:
     """
     Collect papers by searching ArXiv with multiple queries in parallel.
 
-    Strategy: OPTION A (batch queries + parallel execution)
-    1. Use LLM to generate search queries from topics
-    2. Execute all queries in parallel via asyncio.gather()
-    3. Return collected papers (reducer will append to state.papers)
-
     Input: strategy (with topics)
-    Output: papers (List[PaperMetadata] + citation data)
+    Output: papers (List[RankedPaper] appended via operator.add reducer)
     """
     try:
         if not state.get("strategy"):
@@ -154,7 +150,6 @@ async def paper_collection_node(state: StateDict) -> dict[str, Any]:
         strategy = state["strategy"]
         logger.info(f"paper_collection_node: collecting papers for topics {strategy.topics}")
 
-        # STEP 1: Use LLM to generate search queries from topics
         topics_text = "\n".join([f"- {t}" for t in strategy.topics])
 
         query_generation_prompt = f"""
@@ -168,34 +163,30 @@ Return ONLY a JSON array of strings like: ["query1", "query2", "query3"]
 No other text.
 """
 
-        # Call LLM to get search queries
         query_response = await asyncio.to_thread(
             llm.invoke,
             query_generation_prompt,
         )
 
-        # Parse JSON response (llm returns string or content)
         import json
+        import re
         try:
             if hasattr(query_response, "content"):
                 response_text = query_response.content
             else:
                 response_text = str(query_response)
 
-            # Extract JSON array from response
-            import re
             json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
             if json_match:
                 search_queries = json.loads(json_match.group())
             else:
-                search_queries = strategy.topics  # Fallback to topics
+                search_queries = strategy.topics
         except Exception as e:
             logger.warning(f"Failed to parse LLM query response: {e}, using topics as fallback")
             search_queries = strategy.topics
 
         logger.info(f"paper_collection_node: generated queries {search_queries}")
 
-        # STEP 2: Execute all queries sequentially to respect ArXiv rate limits
         search_results = []
         for q in search_queries:
             try:
@@ -206,11 +197,10 @@ No other text.
                     date_range_end=strategy.date_range_end,
                 )
                 search_results.append(res)
-                await asyncio.sleep(1.0)  # Short pause to prevent API blocking
+                await asyncio.sleep(1.0)
             except Exception as e:
                 search_results.append(e)
 
-        # Flatten results and handle errors
         all_papers = []
         for i, result in enumerate(search_results):
             if isinstance(result, Exception):
@@ -227,15 +217,12 @@ No other text.
                 "search_queries_tried": search_queries,
             }
 
-        # STEP 3: Fetch citation data for each paper (parallel)
         citation_tasks = [
             semantic_scholar_tool.coroutine(paper.arxiv_id)
             for paper in all_papers
         ]
-
         citation_results = await asyncio.gather(*citation_tasks, return_exceptions=True)
 
-        # STEP 4: Convert to RankedPaper objects (preliminary ranking)
         ranked_papers = []
         for paper, citation_result in zip(all_papers, citation_results):
             if isinstance(citation_result, Exception):
@@ -251,15 +238,15 @@ No other text.
                 published_date=paper.published_date,
                 url=paper.pdf_url,
                 citation_count=citation_data.citation_count,
-                relevance_score=0.5,  # Will be refined by gap analyzer
-                recency_score=0.5,    # Will be refined by ranking node
-                composite_rank_score=0.0,  # Will be set by ranking node
+                relevance_score=0.5,
+                recency_score=0.5,
+                composite_rank_score=0.0,
                 rank_position=1,
             )
             ranked_papers.append(ranked_paper)
 
         return {
-            "papers": ranked_papers,  # merge_papers reducer deduplicates by arxiv_id
+            "papers": ranked_papers,
             "status": "papers_collected",
             "search_queries_tried": search_queries,
             "iteration_count": state["iteration_count"] + 1,
@@ -281,32 +268,18 @@ No other text.
 def ranking_node(state: StateDict) -> dict[str, Any]:
     """
     Rank papers by composite score (citation + recency + relevance).
-
-    Input: papers (collected so far)
-    Output: ranked_papers (sorted view) — does NOT write back to papers
-
-    Key fix: ranking is a VIEW over papers, not a mutation.
-    Writing back to papers field caused duplication via operator.add reducer.
-    Now writes to ranked_papers (Optional field, plain overwrite).
-
-    Note: Synchronous (pure math, no I/O)
+    Writes to ranked_papers (separate field) — NOT back to papers.
     """
     try:
         if not state.get("papers"):
             logger.warning("ranking_node: no papers to rank")
-            return {
-                "status": "no_papers_to_rank",
-            }
+            return {"status": "no_papers_to_rank"}
 
         papers = state["papers"]
         logger.info(f"ranking_node: ranking {len(papers)} papers")
 
-        # Call the paper_ranker_tool
         ranked = paper_ranker_tool.func(papers)
 
-        # Write to ranked_papers (separate field) — NOT back to papers
-        # This prevents the duplication bug where operator.add would append
-        # the same ranked list on top of already-collected papers
         return {
             "ranked_papers": ranked,
             "status": "papers_ranked",
@@ -321,6 +294,7 @@ def ranking_node(state: StateDict) -> dict[str, Any]:
             "iteration_count": state["iteration_count"] + 1,
         }
 
+
 # ============================================================================
 # NODE 3.5: CONTEXT_BUDGETING_NODE
 # ============================================================================
@@ -329,23 +303,16 @@ async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
     """
     Prune agent state BEFORE gap_analysis_node sees it.
 
-    Runs AFTER ranking_node (scores exist) — BEFORE gap_analysis_node (LLM call).
-    Prevents Lost-in-the-Middle: top papers ignored when 50+ stuffed into prompt.
-
-    Does 3 things:
-      1. ranked_papers > 20      → keep top-20 by composite_rank_score
-      2. conversation_history    → token-aware trigger (> HISTORY_TOKEN_THRESHOLD)
-                                   summarize old turns → summarized_history
-      3. gaps > 5                → keep top-5 unresolved gaps
-
-    Input:  full AgentState (ranked_papers, conversation_history, gaps)
-    Output: pruned ranked_papers, updated summarized_history, pruned gaps
+    1. ranked_papers > 20      → keep top-20 by composite_rank_score
+    2. conversation_history    → token-aware trigger (> HISTORY_TOKEN_THRESHOLD)
+                                  summarize old turns → summarized_history
+    3. gaps > 5                → keep top-5 unresolved gaps
     """
     try:
         enc = tiktoken.encoding_for_model("gpt-4")
         updates: dict[str, Any] = {}
 
-        # ── 1. PRUNE PAPERS ─────────────────────────────────────────────────
+        # 1. PRUNE PAPERS
         ranked_papers = state.get("ranked_papers") or []
         if len(ranked_papers) > 20:
             before_tokens = len(enc.encode(
@@ -365,13 +332,12 @@ async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
             )
             updates["ranked_papers"] = ranked_papers
 
-        # ── 2. SUMMARIZE CONVERSATION HISTORY (token-aware trigger) ─────────
+        # 2. SUMMARIZE CONVERSATION HISTORY (token-aware trigger)
         history = state.get("conversation_history", [])
         history_text = " ".join(m.get("content", "") for m in history)
         history_tokens = len(enc.encode(history_text))
 
         if history_tokens > HISTORY_TOKEN_THRESHOLD:
-            # Keep last 4 turns raw — summarize everything before that
             old_turns = history[:-4]
             recent_turns = history[-4:]
 
@@ -404,7 +370,6 @@ Return ONLY the summary, no other text."""
                 f"{after_history_tokens} (trigger threshold={HISTORY_TOKEN_THRESHOLD})"
             )
 
-            # Append to any existing summarized_history
             existing_summary = state.get("summarized_history", "")
             new_summary = (
                 f"{existing_summary}\n\n[[Summary of turns 1–{len(history)-4}]]:\n{summary_text}"
@@ -415,10 +380,9 @@ Return ONLY the summary, no other text."""
             updates["conversation_history"] = recent_turns
             updates["summarized_history"] = new_summary
 
-        # ── 3. PRUNE GAPS ────────────────────────────────────────────────────
+        # 3. PRUNE GAPS
         gaps = state.get("gaps", [])
         if len(gaps) > 5:
-            # Keep unresolved gaps first, then resolved, trim to 5
             unresolved = [g for g in gaps if not g.resolved]
             resolved = [g for g in gaps if g.resolved]
             pruned_gaps = (unresolved + resolved)[:5]
@@ -444,12 +408,9 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
     """
     Identify knowledge gaps by analyzing papers against the goal.
 
-    Input: papers (top-ranked), goal, conversation_history
-    Output: gaps (List[KnowledgeGap])
-
-    Uses LLM with structured output.
-    Note: context_budgeting_node already caps ranked_papers to 20,
-    so settings.max_papers_per_iteration slice is redundant but harmless.
+    HITL NOTE: Graph pauses AFTER this node (interrupt_after=["gap_analysis"]).
+    The full state (including gaps) is persisted to SQLite at this point.
+    The API reads state.gaps to surface questions to the user.
     """
     try:
         if not state.get("papers"):
@@ -459,18 +420,16 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
                 "status": "no_papers_to_analyze",
             }
 
-        # Use ranked_papers if available, fall back to papers
         papers_to_analyze = state.get("ranked_papers") or state["papers"]
         logger.info(f"gap_analysis_node: analyzing {len(papers_to_analyze)} papers")
 
-        # Call gap analyzer tool (which calls LLM internally)
         gaps = await gap_analyzer_tool.coroutine(
             papers=papers_to_analyze[:settings.max_papers_per_iteration],
             goal=state["goal"],
             conversation_history=state.get("conversation_history", []),
         )
 
-        logger.info(f"gap_analysis_node: identified {len(gaps)} gaps")
+        logger.info(f"gap_analysis_node: identified {len(gaps)} gaps → graph will pause here (HITL)")
 
         return {
             "gaps": gaps,
@@ -489,73 +448,84 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
 
 
 # ============================================================================
-# NODE 5: CLARIFICATION_NODE
+# NODE 5: CLARIFICATION_NODE  (M10 — typed ClarifyingQuestion objects)
 # ============================================================================
 
 async def clarification_node(state: StateDict) -> dict[str, Any]:
     """
-    Generate clarifying questions for the user based on identified gaps.
+    Generate typed ClarifyingQuestion objects from identified gaps.
 
-    Input: gaps, goal
-    Output: questions (added to conversation_history)
+    M10 change: Returns List[ClarifyingQuestion] Pydantic objects instead of
+    freeform strings. Each question has:
+      - question: str          (the question text)
+      - gap_id: str            (which KnowledgeGap it addresses)
+      - question_type: str     ("preference" | "constraint" | "clarification")
+      - required: bool         (must user answer this before agent continues?)
 
-    This node runs when the agent needs user input to continue research.
-    It PAUSES here (via interrupt_after in builder.py).
+    These typed objects are stored in state.clarifying_questions and surfaced
+    to the user via the API. The human_input_node then merges answers back.
+
+    Graph pauses here (interrupt_after=["gap_analysis"]) — this node runs
+    AFTER the human answers, as part of the resume flow.
     """
     try:
         gaps = state.get("gaps", [])
         if not gaps:
             logger.info("clarification_node: no gaps, skipping")
-            return {
-                "status": "no_gaps_to_clarify",
-            }
+            return {"status": "no_gaps_to_clarify"}
 
-        logger.info(f"clarification_node: generating questions for {len(gaps)} gaps")
+        logger.info(f"clarification_node: generating typed questions for {len(gaps)} gaps")
 
-        gaps_text = "\n".join([f"- {g.description}" for g in gaps])
+        gaps_text = "\n".join([
+            f"- [gap_id={g.gap_id}] {g.description}" for g in gaps
+        ])
 
         question_prompt = f"""
 The user is researching: {state['goal']}
 
-We've identified these knowledge gaps:
+Identified knowledge gaps:
 {gaps_text}
 
-Generate 2-3 specific, actionable clarifying questions to ask the user.
-Each question should help us understand:
-1. Which gaps are most important to them
-2. What specific aspect they care about
-3. Any constraints or preferences
+Generate 2-3 targeted clarifying questions. For each question, specify:
+- question: the question text
+- gap_id: which gap_id this question addresses
+- question_type: one of "preference" | "constraint" | "clarification"
+  preference   = user's research priorities (e.g., "Do you care more about speed or accuracy?")
+  constraint   = hard limits (e.g., "Only papers from 2023 onwards?")
+  clarification = disambiguate vague goal (e.g., "Do you mean on-device or cloud inference?")
+- required: true if agent cannot continue without this answer, false otherwise
 
-Return ONLY a JSON array of question strings like: ["question1?", "question2?"]
+Return ONLY valid JSON array:
+[
+  {{"question": "...", "gap_id": "...", "question_type": "preference", "required": true}},
+  ...
+]
 No other text.
 """
 
-        # Call LLM for questions
-        q_response = await asyncio.to_thread(
-            llm.invoke,
+        structured_llm = llm.with_structured_output(List[ClarifyingQuestion])
+
+        questions: List[ClarifyingQuestion] = await asyncio.to_thread(
+            structured_llm.invoke,
             question_prompt,
         )
 
-        # Parse questions
-        import json
-        import re
-        try:
-            if hasattr(q_response, "content"):
-                response_text = q_response.content
-            else:
-                response_text = str(q_response)
-
-            json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if json_match:
-                questions = json.loads(json_match.group())
-            else:
-                questions = ["Can you clarify your research goals?"]
-        except Exception as e:
-            logger.warning(f"Failed to parse questions: {e}")
-            questions = ["Can you clarify your research goals?"]
+        logger.info(f"clarification_node: generated {len(questions)} typed questions")
 
         return {
-            "conversation_history": [{"role": "agent", "content": q} for q in questions],
+            "clarifying_questions": questions,
+            "conversation_history": [
+                {
+                    "role": "agent",
+                    "content": q.question,
+                    "metadata": {
+                        "gap_id": q.gap_id,
+                        "question_type": q.question_type,
+                        "required": q.required,
+                    }
+                }
+                for q in questions
+            ],
             "status": "awaiting_user_input",
             "iteration_count": state["iteration_count"] + 1,
         }
@@ -570,6 +540,85 @@ No other text.
 
 
 # ============================================================================
+# NODE 5.5: HUMAN_INPUT_NODE  (M10 — new)
+# ============================================================================
+
+async def human_input_node(state: StateDict) -> dict[str, Any]:
+    """
+    Merge human answers into conversation_history and user_preferences.
+
+    This node runs AFTER the human resumes the graph via:
+        app.update_state(config, {"user_answers": answers})
+        app.invoke(None, config)
+
+    It reads state.user_answers (a list of dicts with question + answer),
+    and writes them into conversation_history so all subsequent nodes
+    (planning_node, gap_analysis_node) see the enriched context.
+
+    State fields read:   user_answers (injected by update_state)
+    State fields written: conversation_history (appended), user_preferences (merged)
+
+    The None in invoke(None, config) tells LangGraph: "no new user message,
+    just load the checkpoint and continue from where we paused."
+    """
+    try:
+        user_answers = state.get("user_answers", [])
+
+        if not user_answers:
+            logger.info("human_input_node: no user_answers in state, skipping")
+            return {"status": "no_user_input"}
+
+        logger.info(f"human_input_node: merging {len(user_answers)} answers into state")
+
+        # Build conversation_history entries from user answers
+        new_history_entries = []
+        preference_updates = {}
+
+        for answer_obj in user_answers:
+            question = answer_obj.get("question", "")
+            answer = answer_obj.get("answer", "")
+            question_type = answer_obj.get("question_type", "clarification")
+
+            # All answers go into conversation_history
+            new_history_entries.append({
+                "role": "user",
+                "content": answer,
+                "metadata": {
+                    "in_response_to": question,
+                    "question_type": question_type,
+                }
+            })
+
+            # Constraint/preference answers ALSO update user_preferences
+            # (semantic memory — persists across future iterations)
+            if question_type in ("preference", "constraint"):
+                preference_updates[question] = answer
+
+        # Merge into existing user_preferences (don't overwrite, update)
+        existing_prefs = state.get("user_preferences", {}) or {}
+        merged_prefs = {**existing_prefs, **preference_updates}
+
+        logger.info(
+            f"human_input_node: added {len(new_history_entries)} history entries, "
+            f"updated {len(preference_updates)} preferences"
+        )
+
+        return {
+            "conversation_history": new_history_entries,  # reducer appends
+            "user_preferences": merged_prefs,
+            "user_answers": [],   # clear after consuming
+            "status": "user_input_merged",
+        }
+
+    except Exception as e:
+        logger.error(f"human_input_node failed: {str(e)}")
+        return {
+            "status": "error",
+            "last_error": f"human_input_node: {str(e)}",
+        }
+
+
+# ============================================================================
 # NODE 6: SYNTHESIS_NODE
 # ============================================================================
 
@@ -577,30 +626,21 @@ async def synthesis_node(state: StateDict) -> dict[str, Any]:
     """
     Generate the final research brief from collected papers and insights.
 
-    Input: ranked_papers (preferred) or papers, gaps, goal, conversation_history
-    Output: ResearchBrief written to state.research_brief
-
-    Fix: brief is now returned in state update — previously it was created
-    but never written back, causing it to be silently lost.
+    Fix (M9): brief is explicitly returned in state update.
+    Previously brief was created but never written back → silent data loss.
     """
     try:
-        # Use ranked_papers if available (they have composite scores set)
         papers = state.get("ranked_papers") or state.get("papers", [])
         gaps = state.get("gaps", [])
 
         logger.info(f"synthesis_node: synthesizing brief from {len(papers)} papers")
 
-        # Format papers for LLM
         papers_text = "\n".join([
             f"{i+1}. {p.title}\n   Citations: {p.citation_count}, Score: {p.composite_rank_score:.2f}"
-            for i, p in enumerate(papers[:10])  # Top 10 papers
+            for i, p in enumerate(papers[:10])
         ])
 
-        # Format gaps
-        gaps_text = "\n".join([
-            f"- {g.description}"
-            for g in gaps[:5]
-        ])
+        gaps_text = "\n".join([f"- {g.description}" for g in gaps[:5]])
 
         synthesis_prompt = f"""
 You are a research synthesizer. Create a brief that summarizes the research.
@@ -628,7 +668,6 @@ Return ONLY valid JSON with these fields:
 No other text.
 """
 
-        # Call LLM for synthesis
         structured_llm = llm.with_structured_output(ResearchBrief)
 
         brief = await asyncio.to_thread(
@@ -636,14 +675,12 @@ No other text.
             synthesis_prompt,
         )
 
-        # Add metadata
         brief.iterations_taken = state["iteration_count"]
         brief.total_papers_found = len(papers)
         brief.top_papers = papers[:20]
 
         logger.info(f"synthesis_node: created brief with {len(brief.key_findings)} findings")
 
-        # FIX: write brief back to state — previously this was missing
         return {
             "research_brief": brief,
             "status": "complete",
