@@ -11,6 +11,7 @@ Each node:
 
 import asyncio
 import logging
+import tiktoken
 from typing import Any, Optional, List
 from datetime import datetime
 
@@ -280,7 +281,111 @@ def ranking_node(state: StateDict) -> dict[str, Any]:
             "iteration_count": state["iteration_count"] + 1,
         }
 
+# ============================================================================
+# NODE 3.5: CONTEXT_BUDGETING_NODE
+# ============================================================================
 
+async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
+    """
+    Prune agent state BEFORE gap_analysis_node sees it.
+
+    Runs AFTER ranking_node (scores exist) — BEFORE gap_analysis_node (LLM call).
+    Prevents Lost-in-the-Middle: top papers ignored when 50+ stuffed into prompt.
+
+    Does 3 things:
+      1. ranked_papers > 20  → keep top-20 by composite_rank_score
+      2. conversation_history > 10 → summarize old turns → summarized_history
+      3. gaps > 5             → keep top-5 unresolved gaps
+
+    Input:  full AgentState (ranked_papers, conversation_history, gaps)
+    Output: pruned ranked_papers, updated summarized_history, pruned gaps
+    """
+    try:
+        enc = tiktoken.encoding_for_model("gpt-4")
+        updates: dict[str, Any] = {}
+
+        # ── 1. PRUNE PAPERS ─────────────────────────────────────────────────
+        ranked_papers = state.get("ranked_papers") or []
+        if len(ranked_papers) > 20:
+            before_tokens = len(enc.encode(
+                " ".join(p.title + " " + p.abstract for p in ranked_papers)
+            ))
+            ranked_papers = sorted(
+                ranked_papers,
+                key=lambda p: p.composite_rank_score,
+                reverse=True
+            )[:20]
+            after_tokens = len(enc.encode(
+                " ".join(p.title + " " + p.abstract for p in ranked_papers)
+            ))
+            logger.info(
+                f"context_budgeting_node: papers {len(state.get('ranked_papers', []))} → 20 | "
+                f"tokens {before_tokens} → {after_tokens}"
+            )
+            updates["ranked_papers"] = ranked_papers
+
+        # ── 2. SUMMARIZE CONVERSATION HISTORY ───────────────────────────────
+        history = state.get("conversation_history", [])
+        if len(history) > 10:
+            # Keep last 4 turns fresh — summarize everything before that
+            old_turns = history[:-4]
+            recent_turns = history[-4:]
+
+            old_text = "\n".join(
+                f"{m.get('role', 'unknown')}: {m.get('content', '')}"
+                for m in old_turns
+            )
+
+            summary_prompt = f"""Summarize this research conversation history concisely (3-5 sentences).
+Preserve: key user preferences, important clarifications, what topics were ruled out.
+Discard: filler, repetition, back-and-forth confirmations.
+
+History:
+{old_text}
+
+Return ONLY the summary, no other text."""
+
+            summary_response = await asyncio.to_thread(llm.invoke, summary_prompt)
+            summary_text = (
+                summary_response.content
+                if hasattr(summary_response, "content")
+                else str(summary_response)
+            )
+
+            # Append to any existing summarized_history
+            existing_summary = state.get("summarized_history", "")
+            new_summary = (
+                f"{existing_summary}\n\n[Summary of turns {len(history)-len(old_turns)+1}–{len(history)-4}]:\n{summary_text}"
+                if existing_summary
+                else f"[Summary of earlier turns]:\n{summary_text}"
+            )
+
+            logger.info(
+                f"context_budgeting_node: history {len(history)} msgs → "
+                f"4 recent + summary ({len(enc.encode(summary_text))} tokens)"
+            )
+            updates["conversation_history"] = recent_turns
+            updates["summarized_history"] = new_summary
+
+        # ── 3. PRUNE GAPS ────────────────────────────────────────────────────
+        gaps = state.get("gaps", [])
+        if len(gaps) > 5:
+            # Keep unresolved gaps first, then resolved, trim to 5
+            unresolved = [g for g in gaps if not g.resolved]
+            resolved = [g for g in gaps if g.resolved]
+            pruned_gaps = (unresolved + resolved)[:5]
+            logger.info(f"context_budgeting_node: gaps {len(gaps)} → 5")
+            updates["gaps"] = pruned_gaps
+
+        updates["status"] = "context_budgeted"
+        return updates
+
+    except Exception as e:
+        logger.error(f"context_budgeting_node failed: {str(e)}")
+        return {
+            "status": "error",
+            "last_error": f"context_budgeting_node: {str(e)}",
+        }
 # ============================================================================
 # NODE 4: GAP_ANALYSIS_NODE
 # ============================================================================

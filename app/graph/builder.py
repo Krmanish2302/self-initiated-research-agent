@@ -14,10 +14,12 @@ from app.graph.nodes import (
     planning_node,
     paper_collection_node,
     ranking_node,
+    context_budgeting_node,   
     gap_analysis_node,
     clarification_node,
     synthesis_node,
 )
+
 from app.graph.router import should_continue
 from app.config import settings
 
@@ -41,6 +43,7 @@ def build_graph():
     graph.add_node("planning", planning_node)
     graph.add_node("paper_collection", paper_collection_node)
     graph.add_node("ranking", ranking_node)
+    graph.add_node("context_budgeting", context_budgeting_node)
     graph.add_node("gap_analysis", gap_analysis_node)
     graph.add_node("clarification", clarification_node)
     graph.add_node("synthesis", synthesis_node)
@@ -51,7 +54,8 @@ def build_graph():
     graph.add_edge(START, "planning")  # Entry point
     graph.add_edge("planning", "paper_collection")
     graph.add_edge("paper_collection", "ranking")
-    graph.add_edge("ranking", "gap_analysis")
+    graph.add_edge("ranking", "context_budgeting")
+    graph.add_edge("context_budgeting", "gap_analysis")
     graph.add_edge("clarification", "synthesis")
     graph.add_edge("synthesis", END)  # Exit point
     
