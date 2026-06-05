@@ -35,6 +35,9 @@ from app.graph.state import StateDict
 
 logger = logging.getLogger(__name__)
 
+# Token threshold: if conversation_history exceeds this, compress old turns
+HISTORY_TOKEN_THRESHOLD = 2000
+
 
 # ============================================================================
 # NODE 1: PLANNING_NODE
@@ -330,9 +333,10 @@ async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
     Prevents Lost-in-the-Middle: top papers ignored when 50+ stuffed into prompt.
 
     Does 3 things:
-      1. ranked_papers > 20  → keep top-20 by composite_rank_score
-      2. conversation_history > 10 → summarize old turns → summarized_history
-      3. gaps > 5             → keep top-5 unresolved gaps
+      1. ranked_papers > 20      → keep top-20 by composite_rank_score
+      2. conversation_history    → token-aware trigger (> HISTORY_TOKEN_THRESHOLD)
+                                   summarize old turns → summarized_history
+      3. gaps > 5                → keep top-5 unresolved gaps
 
     Input:  full AgentState (ranked_papers, conversation_history, gaps)
     Output: pruned ranked_papers, updated summarized_history, pruned gaps
@@ -361,10 +365,13 @@ async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
             )
             updates["ranked_papers"] = ranked_papers
 
-        # ── 2. SUMMARIZE CONVERSATION HISTORY ───────────────────────────────
+        # ── 2. SUMMARIZE CONVERSATION HISTORY (token-aware trigger) ─────────
         history = state.get("conversation_history", [])
-        if len(history) > 10:
-            # Keep last 4 turns fresh — summarize everything before that
+        history_text = " ".join(m.get("content", "") for m in history)
+        history_tokens = len(enc.encode(history_text))
+
+        if history_tokens > HISTORY_TOKEN_THRESHOLD:
+            # Keep last 4 turns raw — summarize everything before that
             old_turns = history[:-4]
             recent_turns = history[-4:]
 
@@ -372,6 +379,8 @@ async def context_budgeting_node(state: StateDict) -> dict[str, Any]:
                 f"{m.get('role', 'unknown')}: {m.get('content', '')}"
                 for m in old_turns
             )
+
+            before_history_tokens = len(enc.encode(old_text))
 
             summary_prompt = f"""Summarize this research conversation history concisely (3-5 sentences).
 Preserve: key user preferences, important clarifications, what topics were ruled out.
@@ -389,6 +398,12 @@ Return ONLY the summary, no other text."""
                 else str(summary_response)
             )
 
+            after_history_tokens = len(enc.encode(summary_text))
+            logger.info(
+                f"context_budgeting_node: history tokens {before_history_tokens} → "
+                f"{after_history_tokens} (trigger threshold={HISTORY_TOKEN_THRESHOLD})"
+            )
+
             # Append to any existing summarized_history
             existing_summary = state.get("summarized_history", "")
             new_summary = (
@@ -397,10 +412,6 @@ Return ONLY the summary, no other text."""
                 else f"[Summary of earlier turns]:\n{summary_text}"
             )
 
-            logger.info(
-                f"context_budgeting_node: history {len(history)} msgs → "
-                f"4 recent + summary ({len(enc.encode(summary_text))} tokens)"
-            )
             updates["conversation_history"] = recent_turns
             updates["summarized_history"] = new_summary
 
@@ -423,6 +434,8 @@ Return ONLY the summary, no other text."""
             "status": "error",
             "last_error": f"context_budgeting_node: {str(e)}",
         }
+
+
 # ============================================================================
 # NODE 4: GAP_ANALYSIS_NODE
 # ============================================================================
@@ -435,6 +448,8 @@ async def gap_analysis_node(state: StateDict) -> dict[str, Any]:
     Output: gaps (List[KnowledgeGap])
 
     Uses LLM with structured output.
+    Note: context_budgeting_node already caps ranked_papers to 20,
+    so settings.max_papers_per_iteration slice is redundant but harmless.
     """
     try:
         if not state.get("papers"):
@@ -563,7 +578,10 @@ async def synthesis_node(state: StateDict) -> dict[str, Any]:
     Generate the final research brief from collected papers and insights.
 
     Input: ranked_papers (preferred) or papers, gaps, goal, conversation_history
-    Output: ResearchBrief (executive_summary, key_findings, remaining_gaps, etc.)
+    Output: ResearchBrief written to state.research_brief
+
+    Fix: brief is now returned in state update — previously it was created
+    but never written back, causing it to be silently lost.
     """
     try:
         # Use ranked_papers if available (they have composite scores set)
@@ -625,7 +643,9 @@ No other text.
 
         logger.info(f"synthesis_node: created brief with {len(brief.key_findings)} findings")
 
+        # FIX: write brief back to state — previously this was missing
         return {
+            "research_brief": brief,
             "status": "complete",
         }
 
