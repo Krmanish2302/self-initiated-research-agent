@@ -392,7 +392,7 @@ Return ONLY the summary, no other text."""
             # Append to any existing summarized_history
             existing_summary = state.get("summarized_history", "")
             new_summary = (
-                f"{existing_summary}\n\n[Summary of turns {len(history)-len(old_turns)+1}–{len(history)-4}]:\n{summary_text}"
+                f"{existing_summary}\n\n[[Summary of turns 1–{len(history)-4}]]:\n{summary_text}"
                 if existing_summary
                 else f"[Summary of earlier turns]:\n{summary_text}"
             )
