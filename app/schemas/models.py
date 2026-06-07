@@ -48,6 +48,12 @@ class RankedPaper(BaseModel):
     rank_position: int = 1
 
 
+class RankingWeights(BaseModel):
+    citation_weight: float = Field(default=0.33, description="Weight for citation count (0.0 - 1.0)")
+    relevance_weight: float = Field(default=0.33, description="Weight for paper relevance score (0.0 - 1.0)")
+    recency_weight: float = Field(default=0.34, description="Weight for paper recency (0.0 - 1.0)")
+
+
 # ============================================================================
 # STRATEGY + GAP MODELS
 # ============================================================================
