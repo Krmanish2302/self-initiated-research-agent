@@ -1,4 +1,4 @@
-# app/api/main.py - PART 1: Pydantic models + app setup
+# app/api/main.py
 
 """
 FastAPI layer for the Self-Initiated Research Agent.
@@ -13,7 +13,12 @@ from typing import Any, AsyncIterator, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from app.graph.builder import build_graph
+
+# Import the singleton — do NOT call build_graph() again here.
+# builder.py already calls build_graph() once at module load and exposes
+# agent_graph. Calling build_graph() a second time would open a second
+# SqliteSaver connection to the same DB file, causing checkpoint corruption.
+from app.graph.builder import agent_graph as _research_app
 from app.graph.hitl import get_pending_questions, resume_with_answers
 from app.schemas.models import ResearchBrief
 import logging
@@ -28,9 +33,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Singleton — compiled once
-_research_app = build_graph()
-
 
 # ── PYDANTIC REQUEST / RESPONSE MODELS ───────────────────────────────────────
 
@@ -41,7 +43,14 @@ class ResearchGoalRequest(BaseModel):
 
 
 class UserAnswerRequest(BaseModel):
-    """Input to POST /research/{thread_id}/respond"""
+    """
+    Input to POST /research/{thread_id}/respond.
+
+    answers is a list of plain strings. Each string is treated as the
+    answer to the corresponding pending question (in order). The endpoint
+    zips them with the pending questions to build the structured dicts
+    that human_input_node expects.
+    """
     answers: list[str] = Field(..., min_length=1, description="Answers to agent's questions")
 
 
@@ -60,18 +69,21 @@ class SSEEvent(BaseModel):
     event: str       # "node_started" | "papers_found" | "questions_ready" | "complete" | "error"
     data: dict[str, Any]
 
-# app/api/main.py - PART 2: SSE helper + three endpoints
 
 # ── SSE HELPER ────────────────────────────────────────────────────────────────
 
 async def event_stream(
     goal: str,
     thread_id: str,
-    input_state: dict,
+    input_state: Optional[dict],
 ) -> AsyncIterator[str]:
     """
     Runs the agent and yields SSE-formatted strings.
     Closes the stream when agent pauses (HITL) or completes.
+
+    When input_state is None (HITL resume path), the graph is already
+    checkpointed and resume_with_answers has already injected user_answers,
+    so we call astream_events with None to continue from the checkpoint.
     """
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -95,16 +107,15 @@ async def event_stream(
 
             # Papers collected
             elif kind == "on_chain_end" and name == "paper_collection":
-                papers = event["data"]["output"].get("papers", [])
+                output = event["data"].get("output") or {}
+                papers = output.get("papers", [])
                 yield format_sse("papers_found", {"count": len(papers)})
 
             # HITL pause — agent has questions
             elif kind == "on_chain_end" and name == "gap_analysis":
                 state = await _research_app.aget_state(config)
                 if state.next == ():  # graph paused
-                    questions = get_pending_questions(
-                        _research_app, config
-                    )
+                    questions = get_pending_questions(_research_app, config)
                     yield format_sse("questions_ready", {
                         "questions": questions,
                         "thread_id": thread_id,
@@ -113,7 +124,7 @@ async def event_stream(
 
             # Synthesis complete
             elif kind == "on_chain_end" and name == "synthesis":
-                output = event["data"]["output"]
+                output = event["data"].get("output") or {}
                 brief = output.get("research_brief")
                 yield format_sse("complete", {
                     "research_brief": brief.model_dump() if brief else None
@@ -143,6 +154,13 @@ async def start_research(request: ResearchGoalRequest):
             input_state={
                 "goal": request.goal,
                 "max_iterations": request.max_iterations,
+                "iteration_count": 0,
+                "papers": [],
+                "gaps": [],
+                "conversation_history": [],
+                "failed_searches": [],
+                "search_queries_tried": [],
+                "user_preferences": {},
             },
         ),
         media_type="text/event-stream",
@@ -157,6 +175,11 @@ async def respond_to_questions(thread_id: str, request: UserAnswerRequest):
     """
     Submits user answers to a paused agent.
     Resumes the agent and streams continuation via SSE.
+
+    The request body contains a list of plain answer strings. We read the
+    pending questions from state, zip them with the answers, and build the
+    structured dicts that human_input_node expects:
+      {question, answer, question_type}
     """
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -172,10 +195,27 @@ async def respond_to_questions(thread_id: str, request: UserAnswerRequest):
             detail="Agent is not paused. Cannot submit answers."
         )
 
-    # Inject answers into checkpoint via update_state
-    resume_with_answers(_research_app, config, request.answers)
+    # Read pending questions to pair with answers
+    pending_questions = get_pending_questions(_research_app, config)
 
-    # Resume and stream continuation
+    # Build structured answer dicts that human_input_node reads.
+    # If user sent more answers than questions, ignore the extras.
+    # If fewer answers than questions, leave the rest unanswered.
+    structured_answers = []
+    for i, answer_text in enumerate(request.answers):
+        question_text = pending_questions[i] if i < len(pending_questions) else ""
+        structured_answers.append({
+            "question": question_text,
+            "answer": answer_text,
+            # Default to clarification; typed ClarifyingQuestion objects carry
+            # the real type but this is a safe fallback for the simple str path.
+            "question_type": "clarification",
+        })
+
+    # Inject answers into checkpoint via update_state, then resume via SSE
+    resume_with_answers(_research_app, config, structured_answers)
+
+    # Stream continuation — input_state=None means "resume from checkpoint"
     return StreamingResponse(
         event_stream(
             goal="",           # goal already in state

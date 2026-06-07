@@ -14,6 +14,8 @@ from app.schemas.models import (
     RankedPaper,
     KnowledgeGap,
     ResearchStrategy,
+    ClarifyingQuestion,
+    ResearchBrief,
 )
 
 
@@ -73,3 +75,12 @@ class StateDict(TypedDictExt):
     
     # --- CONTEXT MANAGEMENT ---
     summarized_history: Optional[str]
+
+    # --- HITL (M10) ---
+    # clarification_node writes typed ClarifyingQuestion objects here
+    clarifying_questions: Optional[List[ClarifyingQuestion]]
+    # human_input_node reads this list then clears it after consuming
+    user_answers: Optional[List[dict]]
+
+    # --- OUTPUT ---
+    research_brief: Optional[ResearchBrief]
